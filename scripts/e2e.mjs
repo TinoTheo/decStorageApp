@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * End-to-end test against a running coordinator, using the same client library
- * the browser uses. Run it with scripts/run-e2e.sh, which starts a throwaway
+ * the browser uses. Run it with `python tasks.py e2e`, which starts a throwaway
  * server, or point it at one yourself:
  *
  *   BASE_URL=http://127.0.0.1:8000 STAGING_DIR=coordinator/staging node scripts/e2e.mjs

@@ -20,7 +20,7 @@ class CidTests(SimpleTestCase):
 
 class LocalSegmentStoreTests(SimpleTestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.store = LocalSegmentStore(self.tmp.name)
 
     def tearDown(self):

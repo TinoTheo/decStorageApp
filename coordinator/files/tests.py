@@ -28,7 +28,7 @@ def sha(data):
 class FilesTestCase(APITestCase):
     def setUp(self):
         cache.clear()
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.overrides = override_settings(
             SEGMENT_SIZE=SEGMENT,
             MAX_FILE_SIZE=100 * SEGMENT,

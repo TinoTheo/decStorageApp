@@ -9,6 +9,7 @@ the device and the server only ever stores ciphertext.
 coordinator/   Django + DRF API: accounts, file records, encrypted segments
 web/src/       Browser crypto and API client (plain ES modules, no build step)
 scripts/       End-to-end test against a live server
+tasks.py       Project commands (install, dev, test) for any OS
 deploy/        Caddy config (HTTPS)
 docs/          Design notes and security model
 node/          Storage node package (arrives in M2)
@@ -16,11 +17,13 @@ node/          Storage node package (arrives in M2)
 
 ## Run it locally
 
-Needs Python 3.12+ and Node 20+ (Node is only used for tests).
+Needs Python 3.10+ and, for the tests, Node.js 20+. The same commands work on
+Windows, macOS and Linux. On Windows, use `py` instead of `python` if
+`python` isn't recognised.
 
 ```bash
-make install   # pip install -r coordinator/requirements.txt
-make dev       # migrate and start on http://127.0.0.1:8000
+python tasks.py install   # install the Python packages
+python tasks.py dev       # start on http://127.0.0.1:8000
 ```
 
 Open http://127.0.0.1:8000, create an account, save the recovery key, and
@@ -30,13 +33,15 @@ upload a file. Browsers only allow WebCrypto on `localhost` or HTTPS, so use
 ## Tests
 
 ```bash
-make test      # all three suites
-make test-py   # 48 Django tests: auth, files, segments, storage, isolation
-make test-js   # 25 crypto tests: tampering, reordering, truncation, recovery
-make e2e       # 13 end-to-end checks against a throwaway live server
+python tasks.py test      # all three suites
+python tasks.py test-py   # 48 server tests: auth, files, segments, storage, isolation
+python tasks.py test-js   # 25 encryption tests: tampering, reordering, truncation, recovery
+python tasks.py e2e       # 13 end-to-end checks against a throwaway live server
 ```
 
-The Django suite passes on both SQLite and Postgres 16.
+On macOS and Linux, `make test` and friends do the same thing.
+
+The server suite passes on both SQLite and Postgres 16.
 
 The end-to-end run registers a user, interrupts an upload and resumes it,
 downloads and compares the bytes, then:

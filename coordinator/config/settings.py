@@ -87,7 +87,8 @@ WSGI_APPLICATION = "config.wsgi.application"
 # Staging and production set DATABASE_URL to Postgres.
 DATABASES = {
     "default": dj_database_url.config(
-        default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
+        # as_posix() keeps the URL valid on Windows (C:/... instead of C:\...).
+        default=f"sqlite:///{(BASE_DIR / 'db.sqlite3').as_posix()}",
         conn_max_age=env_int("DATABASE_CONN_MAX_AGE", 60),
     )
 }
