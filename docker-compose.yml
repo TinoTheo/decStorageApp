@@ -1,0 +1,67 @@
+# Staging stack for M1: Caddy (HTTPS) -> coordinator -> Postgres.
+# M2 adds the gateway Kubo node, a relay, Redis and Celery workers here.
+#
+#   cp .env.example .env   # then set real secrets
+#   docker compose up -d --build
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dstore
+      POSTGRES_USER: dstore
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dstore -d dstore"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: coordinator/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://dstore:${POSTGRES_PASSWORD}@db:5432/dstore
+      STAGING_DIR: /data/staging
+      NUM_PROXIES: "1"
+    volumes:
+      - staging:/data/staging
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # Browsers only allow WebCrypto on HTTPS pages, so TLS isn't optional.
+  # Caddy fetches and renews a certificate for DOMAIN automatically.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - coordinator
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  pgdata:
+  staging:
+  caddy_data:
+  caddy_config:

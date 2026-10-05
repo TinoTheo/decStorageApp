@@ -1,0 +1,18 @@
+{
+  "name": "@dstore/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser-side encryption and API client for dstore.",
+  "type": "module",
+  "exports": {
+    "./crypto": "./src/crypto.js",
+    "./client": "./src/client.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "e2e": "node ../scripts/e2e.mjs"
+  }
+}
