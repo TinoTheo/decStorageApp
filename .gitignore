@@ -6,3 +6,6 @@ coordinator/staging/
 coordinator/staticfiles/
 node_modules/
 .DS_Store
+README.md
+Makefile
+CHANGELOG.md
