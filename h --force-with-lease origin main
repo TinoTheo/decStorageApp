@@ -1,0 +1,27 @@
+7fab179 TinoTheo | Stop tracking README, Makefile, CHANGELOG and .env.example
+
+a98f8b6 TinoTheo | locked-box-git
+
+9475fb0 TinoTheo | locked-box
+
+d46de38 Trai | Run project commands on Windows without make
+tasks.py replaces the Makefile logic and the bash-only e2e script, so
+install, dev, test and e2e work the same on Windows, macOS and Linux.
+The Makefile stays as a thin shortcut for macOS and Linux.
+
+Also keeps the default SQLite URL valid on Windows paths and lets test
+temp folders clean up even if Windows still holds a file open.
+
+90db407 Trai | Add changelog and human release names
+First release is "Locked Box". Upcoming: Many Homes, Self Repair,
+Front Door, Test Drive.
+
+ded4bde Trai | M1: coordinator, browser encryption and demo
+- Django coordinator with zero-knowledge sign-up, sign-in and recovery
+- Encrypted segment upload (SHA-256 checked, resumable) and download
+- Browser crypto library: PBKDF2 + HKDF key hierarchy, AES-256-GCM
+  segments bound to file, index and end-of-file
+- Demo page under a strict Content-Security-Policy
+- 48 Django tests, 25 crypto tests, 13 end-to-end checks
+- Docker Compose with Postgres and Caddy for HTTPS
+

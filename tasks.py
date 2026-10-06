@@ -2,13 +2,16 @@
 """
 Project commands. Works the same on Windows, macOS and Linux; no make or bash needed.
 
-    python tasks.py install    install the Python packages
-    python tasks.py dev        start the app on http://127.0.0.1:8000
-    python tasks.py test       run all three test suites
-    python tasks.py test-py    server tests
-    python tasks.py test-js    encryption tests (needs Node.js 20+)
-    python tasks.py e2e        end-to-end test against a throwaway server (needs Node.js 20+)
-    python tasks.py check      Django checks and missing-migration check
+    python tasks.py install        install the Python packages
+    python tasks.py dev            start the app on http://127.0.0.1:8000
+    python tasks.py test           run every test suite
+    python tasks.py test-py        server tests
+    python tasks.py test-js        encryption tests (needs Node.js 20+)
+    python tasks.py test-agent     node agent tests
+    python tasks.py e2e            end-to-end test against a throwaway server (needs Node.js 20+)
+    python tasks.py network-test   a whole storage network on this machine (needs Node.js 20+);
+                                   set IPFS_BIN=/path/to/ipfs to use real IPFS instead of the stand-in
+    python tasks.py check          Django checks and missing-migration check
 
 On Windows, use `py tasks.py ...` if `python` isn't recognised.
 """
@@ -68,13 +71,22 @@ def dev():
 
 
 def test_py():
-    run([PYTHON, "manage.py", "test"], cwd=COORDINATOR, env=django_env(LOG_LEVEL="ERROR"))
+    run([PYTHON, "manage.py", "test"], cwd=COORDINATOR, env=django_env(LOG_LEVEL="CRITICAL"))
 
 
 def test_js():
     node = require_node()
     files = sorted(glob.glob(str(WEB / "test" / "*.test.js")))
     run([node, "--test", *files], cwd=WEB)
+
+
+def test_agent():
+    run([PYTHON, "-m", "unittest", "discover", "-s", ROOT / "node" / "agent", "-p", "test_*.py"])
+
+
+def network_test():
+    require_node()
+    run([PYTHON, ROOT / "scripts" / "network_e2e.py"], env=django_env())
 
 
 def check():
@@ -142,7 +154,9 @@ def e2e(port=8765):
 def test():
     test_py()
     test_js()
+    test_agent()
     e2e()
+    network_test()
 
 
 COMMANDS = {
@@ -151,7 +165,9 @@ COMMANDS = {
     "test": test,
     "test-py": test_py,
     "test-js": test_js,
+    "test-agent": test_agent,
     "e2e": e2e,
+    "network-test": network_test,
     "check": check,
 }
 

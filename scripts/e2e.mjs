@@ -166,7 +166,13 @@ async function main() {
       altered[100] ^= 0x01;
       await writeFile(victim, altered);
       try {
-        await assert.rejects(alice.downloadFile(fileId), IntegrityError);
+        // The server checks every segment's SHA-256 before sending it, so the
+        // damaged copy never leaves the server (503); if it ever did, the
+        // browser's own checks would raise IntegrityError instead.
+        await assert.rejects(
+          alice.downloadFile(fileId),
+          (err) => (err instanceof ApiError && err.status === 503) || err instanceof IntegrityError,
+        );
       } finally {
         await writeFile(victim, original);
       }

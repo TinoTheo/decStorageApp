@@ -43,6 +43,10 @@ class SegmentSerializer(serializers.ModelSerializer):
 
 class FileSummarySerializer(serializers.ModelSerializer):
     size = serializers.SerializerMethodField()
+    copies = serializers.SerializerMethodField(
+        help_text="Confirmed copies on storage nodes; null when the coordinator isn't on a storage network."
+    )
+    target_copies = serializers.SerializerMethodField()
 
     class Meta:
         model = File
@@ -56,6 +60,8 @@ class FileSummarySerializer(serializers.ModelSerializer):
             "segment_count",
             "created_at",
             "completed_at",
+            "copies",
+            "target_copies",
         ]
 
     def get_size(self, obj):
@@ -64,6 +70,13 @@ class FileSummarySerializer(serializers.ModelSerializer):
         if stored_bytes is None or stored_segments is None:
             return obj.plaintext_size()
         return max((stored_bytes or 0) - settings.GCM_TAG_BYTES * stored_segments, 0)
+
+
+    def get_copies(self, obj):
+        return self.context.get("copies", {}).get(obj.id)
+
+    def get_target_copies(self, obj):
+        return settings.REPLICA_COUNT
 
 
 class FileManifestSerializer(FileSummarySerializer):

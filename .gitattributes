@@ -1,0 +1,7 @@
+# Shell scripts and Python run inside Linux containers, so they must keep Unix
+# line endings even when the repo is checked out on Windows.
+*.sh   text eol=lf
+*.py   text eol=lf
+Dockerfile text eol=lf
+*.yml  text eol=lf
+Caddyfile text eol=lf

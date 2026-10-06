@@ -325,6 +325,9 @@ export class DStoreClient {
           segmentCount: file.segment_count,
           createdAt: file.created_at,
           completedAt: file.completed_at,
+          // Confirmed copies on storage nodes (null when not on a storage network).
+          copies: file.copies ?? null,
+          targetCopies: file.target_copies ?? null,
         };
       }),
     );

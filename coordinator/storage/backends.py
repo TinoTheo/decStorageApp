@@ -1,11 +1,14 @@
 """
-Segment stores.
+Segment stores: where the coordinator keeps the encrypted segments it receives.
 
-The rest of the coordinator only talks to `get_segment_store()`, so moving from
-staging on the coordinator's disk (M1) to pinning on storage nodes (M2) is a
-settings change plus a new backend class, not a rewrite.
+- LocalSegmentStore keeps them on the coordinator's own disk. That's the
+  Locked Box setup, and it's still what local development and the main test
+  suite use. It has no network, so nothing is ever copied to nodes.
+- KuboSegmentStore adds them to the gateway's IPFS node. Storage nodes fetch
+  them from there over the private IPFS network, and once enough nodes confirm
+  their copies the gateway lets its own copy go (see network.services).
 
-Every backend stores opaque encrypted bytes. None of them can read file contents.
+Every store holds opaque encrypted bytes. None of them can read file contents.
 """
 
 import os
@@ -16,30 +19,40 @@ from pathlib import Path
 from django.conf import settings
 from django.utils.module_loading import import_string
 
-from .cid import cid_v1_raw, is_cid_v1_raw
+from .cid import cid_v1_raw, is_cid_v1, is_cid_v1_raw
+from .kubo import KuboClient, KuboError
 
 
-class SegmentNotFound(Exception):
-    pass
+class SegmentStoreError(Exception):
+    """The store couldn't do what was asked. Usually temporary."""
+
+
+class SegmentNotFound(SegmentStoreError):
+    """The segment isn't available from this store right now."""
 
 
 class BaseSegmentStore:
-    """Interface every segment store implements."""
+    #: True when nodes can fetch segments from this store (it's on the IPFS network).
+    supports_network = False
 
     def put(self, data: bytes) -> str:
         """Store encrypted bytes and return their content ID."""
         raise NotImplementedError
 
-    def open(self, content_id: str):
-        """Return a readable binary file object. Raises SegmentNotFound."""
+    def read(self, content_id: str, *, max_bytes: int) -> bytes:
+        """Return the bytes, fetching from the network if needed. Raises SegmentNotFound."""
         raise NotImplementedError
 
-    def exists(self, content_id: str) -> bool:
+    def holds(self, content_id: str) -> bool:
+        """Whether this store keeps its own copy (as opposed to fetching it on demand)."""
         raise NotImplementedError
 
-    def delete(self, content_id: str) -> None:
-        """Remove the bytes. Must not fail if they are already gone."""
+    def release(self, content_id: str) -> None:
+        """Drop this store's own copy. Must not fail if it's already gone."""
         raise NotImplementedError
+
+    def collect_garbage(self) -> None:
+        """Reclaim space from released segments, if the store needs to."""
 
 
 class LocalSegmentStore(BaseSegmentStore):
@@ -77,23 +90,75 @@ class LocalSegmentStore(BaseSegmentStore):
             raise
         return content_id
 
-    def open(self, content_id: str):
+    def read(self, content_id: str, *, max_bytes: int) -> bytes:
         try:
-            return open(self._path(content_id), "rb")
+            with open(self._path(content_id), "rb") as handle:
+                data = handle.read(max_bytes + 1)
         except FileNotFoundError as exc:
             raise SegmentNotFound(content_id) from exc
+        if len(data) > max_bytes:
+            raise SegmentStoreError(f"{content_id} is larger than {max_bytes} bytes")
+        return data
 
-    def exists(self, content_id: str) -> bool:
+    def holds(self, content_id: str) -> bool:
         try:
             return self._path(content_id).exists()
         except SegmentNotFound:
             return False
 
-    def delete(self, content_id: str) -> None:
+    def release(self, content_id: str) -> None:
         try:
             self._path(content_id).unlink(missing_ok=True)
         except SegmentNotFound:
             pass
+
+
+class KuboSegmentStore(BaseSegmentStore):
+    """Segments live on the gateway's IPFS node and, from there, on storage nodes."""
+
+    supports_network = True
+
+    def __init__(self, api_url, fetch_timeout=60):
+        self.client = KuboClient(api_url)
+        self.fetch_timeout = fetch_timeout
+
+    @staticmethod
+    def _check(content_id):
+        if not is_cid_v1(content_id):
+            raise SegmentNotFound(content_id)
+
+    def put(self, data: bytes) -> str:
+        try:
+            return self.client.add(data)
+        except KuboError as exc:
+            raise SegmentStoreError(str(exc)) from exc
+
+    def read(self, content_id: str, *, max_bytes: int) -> bytes:
+        self._check(content_id)
+        try:
+            return self.client.cat(content_id, timeout=self.fetch_timeout, max_bytes=max_bytes)
+        except KuboError as exc:
+            raise SegmentNotFound(str(exc)) from exc
+
+    def holds(self, content_id: str) -> bool:
+        self._check(content_id)
+        try:
+            return self.client.is_pinned(content_id)
+        except KuboError as exc:
+            raise SegmentStoreError(str(exc)) from exc
+
+    def release(self, content_id: str) -> None:
+        self._check(content_id)
+        try:
+            self.client.pin_rm(content_id)
+        except KuboError as exc:
+            raise SegmentStoreError(str(exc)) from exc
+
+    def collect_garbage(self) -> None:
+        try:
+            self.client.repo_gc()
+        except KuboError as exc:
+            raise SegmentStoreError(str(exc)) from exc
 
 
 @lru_cache(maxsize=1)

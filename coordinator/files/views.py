@@ -4,7 +4,8 @@ File and segment endpoints.
 The browser creates a file record, PUTs each encrypted segment (in parallel, in
 any order, retrying freely), then marks the file complete. Every segment is
 checked against the SHA-256 the browser sends, so corruption in transit is caught
-before anything is stored.
+before anything is stored. Downloads are checked against the same SHA-256 before
+they leave the coordinator, so a damaged copy is refused rather than served.
 """
 
 import hashlib
@@ -13,14 +14,16 @@ import re
 
 from django.db import IntegrityError, transaction
 from django.db.models import Count, Prefetch, Sum
-from django.http import FileResponse
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from storage.backends import SegmentNotFound, get_segment_store
+from network.models import Blob
+from network.services import copies_by_content_id, delete_file, register_blob
+from storage.backends import SegmentStoreError, get_segment_store
 
 from .models import File, Segment
 from .serializers import FileCreateSerializer, FileManifestSerializer, FileSummarySerializer, SegmentSerializer
@@ -30,6 +33,8 @@ logger = logging.getLogger(__name__)
 SHA256_HEADER = "X-Content-SHA256"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
+UNAVAILABLE = {"detail": "Segment is temporarily unavailable. Try again shortly."}
+
 
 def _owned_file(request, file_id, *, with_segments=False):
     queryset = File.objects.filter(owner=request.user)
@@ -38,19 +43,38 @@ def _owned_file(request, file_id, *, with_segments=False):
     return get_object_or_404(queryset, id=file_id)
 
 
+def copies_for(files):
+    """
+    The number of confirmed copies of each file: the lowest count across its
+    segments, since a file is only as safe as its least-copied piece. None when
+    the coordinator isn't on a storage network (local development).
+    """
+    if not get_segment_store().supports_network:
+        return {f.id: None for f in files}
+    pairs = list(Segment.objects.filter(file__in=files).values_list("file_id", "content_id"))
+    counts = copies_by_content_id({cid for _, cid in pairs})
+    result = {}
+    for file_id, content_id in pairs:
+        copies = counts.get(content_id, 0)
+        result[file_id] = min(result.get(file_id, copies), copies)
+    return {f.id: result.get(f.id, 0) for f in files}
+
+
 def _manifest(file):
     file = File.objects.prefetch_related(Prefetch("segments", queryset=Segment.objects.order_by("index"))).get(
         pk=file.pk
     )
-    return FileManifestSerializer(file).data
+    return FileManifestSerializer(file, context={"copies": copies_for([file])}).data
 
 
 class FileListCreateView(APIView):
     def get(self, request):
-        files = File.objects.filter(owner=request.user).annotate(
-            stored_bytes=Sum("segments__size"), stored_segments=Count("segments")
+        files = list(
+            File.objects.filter(owner=request.user).annotate(
+                stored_bytes=Sum("segments__size"), stored_segments=Count("segments")
+            )
         )
-        return Response(FileSummarySerializer(files, many=True).data)
+        return Response(FileSummarySerializer(files, many=True, context={"copies": copies_for(files)}).data)
 
     def post(self, request):
         serializer = FileCreateSerializer(data=request.data, context={"owner": request.user})
@@ -65,33 +89,20 @@ class FileListCreateView(APIView):
 
 class FileDetailView(APIView):
     def get(self, request, file_id):
-        file = _owned_file(request, file_id, with_segments=True)
-        return Response(FileManifestSerializer(file).data)
+        file = _owned_file(request, file_id)
+        return Response(_manifest(file))
 
     def delete(self, request, file_id):
-        file = _owned_file(request, file_id)
-        content_ids = set(file.segments.values_list("content_id", flat=True))
-
-        with transaction.atomic():
-            file.delete()
-            still_used = set(
-                Segment.objects.filter(content_id__in=content_ids).values_list("content_id", flat=True)
-            )
-            orphaned = content_ids - still_used
-            # Only remove bytes once the database change is committed. In M2 this
-            # becomes "schedule unpin on every node holding a replica".
-            transaction.on_commit(lambda: _delete_blobs(orphaned))
-
+        # Every node holding a copy is told to drop it, and the gateway drops its own.
+        delete_file(_owned_file(request, file_id))
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-def _delete_blobs(content_ids):
-    store = get_segment_store()
-    for content_id in content_ids:
-        try:
-            store.delete(content_id)
-        except Exception:  # noqa: BLE001 - a failed cleanup must never fail the request
-            logger.exception("Failed to delete segment %s", content_id)
+def _release_quietly(content_id):
+    try:
+        get_segment_store().release(content_id)
+    except SegmentStoreError:
+        logger.warning("Couldn't release unused segment %s from the gateway", content_id, exc_info=True)
 
 
 class SegmentView(APIView):
@@ -128,15 +139,27 @@ class SegmentView(APIView):
         if existing:
             return self._already_uploaded(existing, actual)
 
-        content_id = get_segment_store().put(body)
+        try:
+            content_id = get_segment_store().put(body)
+        except SegmentStoreError:
+            logger.exception("Could not store segment %s of %s", index, file.id)
+            return Response(
+                {"detail": "Storage is temporarily unavailable. Try again shortly."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
         try:
             with transaction.atomic():
                 segment = Segment.objects.create(
                     file=file, index=index, size=len(body), sha256=actual, content_id=content_id
                 )
+                register_blob(content_id, len(body), actual)
         except IntegrityError:
             # Another request stored this index at the same moment.
-            return self._already_uploaded(Segment.objects.get(file=file, index=index), actual)
+            existing = Segment.objects.get(file=file, index=index)
+            if existing.content_id != content_id and not Blob.objects.filter(content_id=content_id).exists():
+                _release_quietly(content_id)
+            return self._already_uploaded(existing, actual)
 
         return Response(SegmentSerializer(segment).data, status=status.HTTP_201_CREATED)
 
@@ -154,12 +177,17 @@ class SegmentView(APIView):
         file = _owned_file(request, file_id)
         segment = get_object_or_404(Segment, file=file, index=index)
         try:
-            handle = get_segment_store().open(segment.content_id)
-        except SegmentNotFound:
-            logger.error("Segment %s is recorded but missing from the store", segment.content_id)
-            return Response({"detail": "Segment is temporarily unavailable."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            data = get_segment_store().read(segment.content_id, max_bytes=segment.size)
+        except SegmentStoreError:
+            logger.error("Segment %s couldn't be fetched", segment.content_id, exc_info=True)
+            return Response(UNAVAILABLE, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        response = FileResponse(handle, content_type="application/octet-stream")
+        if len(data) != segment.size or hashlib.sha256(data).hexdigest() != segment.sha256:
+            # Never hand out bytes that don't match what was uploaded.
+            logger.error("Segment %s failed its integrity check on the way out", segment.content_id)
+            return Response(UNAVAILABLE, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+        response = HttpResponse(data, content_type="application/octet-stream")
         response[SHA256_HEADER] = segment.sha256
         response["Cache-Control"] = "private, no-store"
         response["Access-Control-Expose-Headers"] = SHA256_HEADER
@@ -168,11 +196,11 @@ class SegmentView(APIView):
 
 class FileCompleteView(APIView):
     def post(self, request, file_id):
-        file = _owned_file(request, file_id, with_segments=True)
+        file = _owned_file(request, file_id)
         if file.status == File.Status.COMPLETE:
-            return Response(FileManifestSerializer(file).data)
+            return Response(_manifest(file))
 
-        manifest = FileManifestSerializer(file).data
+        manifest = _manifest(file)
         if manifest["missing_segments"]:
             return Response(
                 {"detail": "Some segments are still missing.", "missing_segments": manifest["missing_segments"]},

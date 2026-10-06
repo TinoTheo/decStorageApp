@@ -118,8 +118,7 @@ class SegmentUploadTests(FilesTestCase):
         response = self.put_segment(self.file_id, 0, data)
         self.assertEqual(response.status_code, 201, response.data)
         self.assertTrue(response.data["content_id"].startswith("bafkrei"))
-        with get_segment_store().open(response.data["content_id"]) as handle:
-            self.assertEqual(handle.read(), data)
+        self.assertEqual(get_segment_store().read(response.data["content_id"], max_bytes=len(data)), data)
 
     def test_rejects_hash_mismatch_and_missing_hash(self):
         data = os.urandom(SEGMENT + TAG)
@@ -174,7 +173,7 @@ class CompleteAndDownloadTests(FilesTestCase):
         for index, expected in enumerate(blobs):
             response = self.client.get(f"/api/files/{file_id}/segments/{index}")
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(b"".join(response.streaming_content), expected)
+            self.assertEqual(response.content, expected)
             self.assertEqual(response["X-Content-SHA256"], sha(expected))
 
     def test_no_uploads_after_complete(self):
@@ -186,7 +185,7 @@ class CompleteAndDownloadTests(FilesTestCase):
     def test_missing_blob_is_reported_not_crashed(self):
         file_id = self.create_file(10).data["id"]
         self.upload_all(file_id, 10)
-        get_segment_store().delete(Segment.objects.get().content_id)
+        get_segment_store().release(Segment.objects.get().content_id)
         self.assertEqual(self.client.get(f"/api/files/{file_id}/segments/0").status_code, 503)
 
 
@@ -214,7 +213,7 @@ class ListAndDeleteTests(FilesTestCase):
         self.assertFalse(File.objects.exists())
         self.assertFalse(Segment.objects.exists())
         for content_id in content_ids:
-            self.assertFalse(get_segment_store().exists(content_id))
+            self.assertFalse(get_segment_store().holds(content_id))
 
 
 class IsolationTests(FilesTestCase):

@@ -1,29 +1,35 @@
 # dstore design notes
 
-These notes cover what M1 builds and the decisions behind it. They're written
-for whoever picks up M2, and for anyone reviewing the security model.
+These notes cover what's been built so far and the decisions behind it. They're
+written for whoever picks up the next release, and for anyone reviewing the
+security model. Day-to-day running of the network is in `operations.md`.
 
-## What M1 delivers
+## Releases so far
 
-- A Django coordinator that handles accounts, file records and encrypted segments.
-- A browser library (`web/src`) that does all encryption on the device.
-- A demo page that uses the same library.
-- Segments are staged on the coordinator's own disk. M2 moves them onto storage
-  nodes without changing the API or the browser library.
+**Locked Box** (M1): a Django coordinator for accounts, file records and
+encrypted segments; a browser library (`web/src`) that does all encryption on
+the device; a demo page using the same library. Promise: **the server never
+holds anything it can decrypt.**
 
-The M1 promise: **the server never holds anything it can decrypt.** The
-end-to-end test proves this on every run. It scans the stored bytes for a
-plaintext marker and for the filename.
+**Many Homes** (M2): encrypted segments leave the coordinator and live on
+independent storage nodes, three copies each, every copy with a different
+operator. Nodes run IPFS (Kubo) plus a small agent. Promise: **no single
+machine and no single operator holds the only copy of anything, and none of
+them can read what they hold.**
+
+Both promises are checked on every test run: the end-to-end tests scan what the
+server and the nodes actually stored for a plaintext marker and the filename.
 
 ## Threat model
 
 | Party | Can see | Cannot see |
 |---|---|---|
 | Coordinator and its database | Usernames, file count, file sizes (rounded to segments), upload times, wrapped keys | Passphrases, master keys, file keys, file names, file contents |
-| Storage nodes (from M2) | Encrypted segments and their CIDs | Which user or file a segment belongs to, or anything inside it |
+| Storage nodes and their operators | Encrypted segments, their CIDs and sizes | Which user or file a segment belongs to, or anything inside it |
+| Other nodes on the private network | That a CID exists, which peers hold it | Anything inside it |
 | Network observer | TLS-protected traffic only | Everything else |
 
-Out of scope for M1:
+Out of scope for now:
 
 - A malicious coordinator serving a modified copy of `client.js`. That's the
   standard limit of any web-delivered end-to-end encryption. The fix is a
@@ -128,11 +134,13 @@ server rejects duplicate IDs.
 
 ## Content IDs
 
-`storage/cid.py` computes a CIDv1 (raw codec, SHA-256) for each staged
-segment. The test suite checks it against the CID IPFS itself produces for
-`hello world`. Kubo splits blocks larger than its chunk size, so from M2 the
-coordinator stores whatever CID Kubo returns. It treats the content ID as
-opaque and keeps its own SHA-256 for integrity checks.
+`storage/cid.py` computes a CIDv1 (raw codec, SHA-256) for segments staged on
+local disk. The test suite checks it against the CID IPFS itself produces for
+`hello world`. With the IPFS store, Kubo adds every segment with fixed settings
+(CIDv1, raw leaves, 1 MiB chunks, SHA-256), so the same bytes give the same CID
+on every node. Segments over 1 MiB come back as a dag-pb root (`bafybei...`).
+The coordinator treats the content ID as opaque and keeps its own SHA-256 for
+integrity checks.
 
 ## Server-side choices
 
@@ -143,27 +151,113 @@ opaque and keeps its own SHA-256 for integrity checks.
   generous per-IP limit (120/min), because mobile carriers put many users behind
   one address. There's also a tight per-username limit (10/min), which is what
   actually slows passphrase guessing, wherever the guesses come from. Behind
-  Caddy, set `NUM_PROXIES=1` (the compose file already does). M1 uses Django's
-  per-process cache, so each limit is multiplied by the number of gunicorn
-  workers. In M2, Redis makes them single shared limits.
+  Caddy, set `NUM_PROXIES=1` (the compose file already does). The counts live
+  in a database-backed cache, so every gunicorn worker shares them.
 - **Content Security Policy:** the page that handles keys runs no inline
   scripts (`script-src 'self'`).
 - **Admin:** shows IDs, sizes and statuses only. Wrapped keys and encrypted
   names are hidden.
 
-## What M2 changes
+## Many Homes: the storage network
 
-- `storage/backends.py` gets a `KuboSegmentStore`. The gateway adds a segment
-  to IPFS, the coordinator picks three nodes from different operators, their
-  agents pin by CID, and the gateway unpins its copy.
-- New models: `Operator`, `Node`, `Replica (segment, node, status, last_verified)`.
-- Celery and Redis come in for placement and cleanup of abandoned uploads.
-  Redis also backs the rate limiter.
-- File deletion schedules an unpin on every node holding a replica.
+### Pieces
 
-## Known limitations in M1
+```
+browser ──HTTPS──► coordinator ──RPC──► gateway IPFS ◄──private IPFS network──► storage nodes
+                       ▲                                                        (IPFS + agent)
+                       └──────────── agents check in over HTTPS ◄───────────────────┘
+```
 
-- Abandoned uploads stay until the user deletes them. A cleanup job comes with Celery in M2.
-- There's no passphrase change while signed in, only via recovery. That's planned for M4.
+- **Gateway IPFS node** (`ipfs` service, next to the coordinator). New uploads
+  are added here first. It's the hub nodes connect to and their relay when
+  they're behind a home router. Its RPC API is never published.
+- **Storage node** = Kubo + the agent (`node/`). Operators install it with
+  Docker. Kubo is configured by `node/kubo/001-dstore.sh` for the private
+  network: swarm key required (`LIBP2P_FORCE_PNET=1`), no public bootstrap
+  peers, routers or resolvers, TCP only, no public HTTP gateway.
+- **Agent** (`node/agent/dstore_agent.py`, standard library only). It always
+  calls the coordinator, never the other way round, so nodes need no port
+  forwarding: register once with an invite code, then heartbeat every few
+  seconds and do the pin and unpin tasks the coordinator hands back.
+- **Worker** (`manage.py run_worker`). One loop does all background work:
+  placement, timeouts, gateway release, deletions, abandoned uploads, gateway
+  garbage collection. It replaces the Celery and Redis plan: there's no fan-out
+  to justify them, and one fewer service to keep running on a single VM.
+
+### Data model (`network` app)
+
+| Model | Purpose |
+|---|---|
+| `Operator` | A person or organisation running nodes. The unit copies are spread across. |
+| `NodeInvite` | Single-use enrollment code (stored hashed), expires after a week by default. |
+| `Node` | One machine: IPFS peer ID, hashed token, capacity and usage, last check-in. |
+| `Blob` | One encrypted segment on the network, by CID. Segments refer to it by CID. |
+| `Replica` | One node's copy of one blob: `assigned` → `stored`, or `releasing` → deleted; `lost` if the node can't be trusted any more. |
+
+### A file's life on the network
+
+1. **Upload.** The coordinator adds each segment to the gateway IPFS node
+   (pinned) and records a `Blob`.
+2. **Placement** (worker). Each blob gets `REPLICA_COUNT` (3) copies:
+   - only on online, active nodes whose operator is active,
+   - never two live copies with the same operator (`REQUIRE_DISTINCT_OPERATORS`),
+   - only where the node has room, counting copies already on their way,
+   - preferring the nodes with the most free space, with a little randomness.
+   A blob that can't get all its copies yet (too few operators online) keeps
+   what it has and is retried on every pass.
+3. **Pinning** (agent). On its next heartbeat the node gets `pin` tasks and
+   runs `ipfs pin add`, which fetches the blocks over the private network and
+   checks every one against its CID. It reports success or failure. Failures
+   are retried `PIN_MAX_ATTEMPTS` times, then the copy is moved elsewhere. A
+   copy not confirmed within `ASSIGNMENT_TIMEOUT_SECONDS` is moved too.
+4. **Gateway release** (worker). Once three nodes have confirmed, the gateway
+   unpins its copy. Garbage collection reclaims the space later.
+5. **Download.** The coordinator asks the gateway IPFS node for the segment,
+   which fetches it from whichever node answers. The coordinator checks the
+   SHA-256 before sending anything to the browser: damaged or unreachable
+   copies give a 503 (the browser retries), never wrong bytes.
+6. **Delete.** Every copy becomes `releasing`, and the gateway drops its copy
+   if it still has one. Nodes unpin on their next heartbeat; a node that's
+   offline does it when it comes back. The `Blob` is removed once no node
+   holds it.
+7. **Abandoned uploads.** Files still `uploading` after
+   `ABANDONED_UPLOAD_AFTER_HOURS` (48) are deleted, copies and all.
+
+### Node API
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/api/nodes/register` | invite code | Enroll; returns the node token (shown once) |
+| POST | `/api/nodes/heartbeat` | `Node <token>` | Report status, receive tasks |
+| POST | `/api/nodes/tasks/{id}` | `Node <token>` | Report a pin or unpin result |
+
+Node tokens and user tokens are separate schemes: neither works on the other's
+endpoints. Results for work the coordinator no longer wants (say, a pin that
+finished after the file was deleted) are ignored, and the node gets the
+follow-up task next time. Pin and unpin are both idempotent, so a lost result
+costs nothing.
+
+If a node's IPFS identity changes (its storage was reset), its copies are
+marked `lost`, placement replaces them elsewhere, and the node is disabled
+until it's re-enrolled with a new invite.
+
+### What Many Homes doesn't do yet
+
+- **Nobody checks that nodes still hold what they confirmed.** A node could
+  delete data and keep heartbeating. Spot-checks come in Self Repair.
+- **A node that stays offline keeps its copies counted.** Self Repair moves
+  copies off nodes that have been gone too long.
+- **Re-replication after a loss** works when the remaining copies are
+  reachable, but nothing measures how long it takes or alerts on it.
+- **Not yet run across real networks.** The network test passes on real Kubo
+  0.43.1 in private-network mode (config, bitswap transfers, gateway release,
+  downloads from nodes, node loss, deletes), but on one machine. NAT traversal
+  through the gateway's relay, and the Docker images, need a run on real
+  machines; see `operations.md`, "First run on real machines".
+
+## Known limitations
+
+- There's no passphrase change while signed in, only via recovery. Planned for Front Door.
 - The file list isn't paginated.
+- Downloads assemble the whole file in memory, so files are capped at 1 GB.
 - Only PBKDF2 is supported. Argon2id (via WebAssembly) can be added as a new `kdf` value without a migration.

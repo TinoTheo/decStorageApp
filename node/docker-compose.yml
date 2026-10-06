@@ -1,0 +1,44 @@
+# A dstore storage node: IPFS (Kubo) plus the dstore agent.
+#
+#   1. Copy .env.example to .env and paste in the lines from your invite.
+#   2. docker compose up -d --build
+#   3. docker compose logs -f agent      (look for "Registered as node ...")
+#
+# Works on Linux, macOS and Windows (Docker Desktop).
+
+name: dstore-node
+
+services:
+  kubo:
+    build: ./kubo
+    restart: unless-stopped
+    environment:
+      DSTORE_ROLE: node
+      DSTORE_SWARM_KEY: ${IPFS_SWARM_KEY:?paste IPFS_SWARM_KEY from your invite into .env}
+      DSTORE_BOOTSTRAP: ${GATEWAY_BOOTSTRAP:?paste GATEWAY_BOOTSTRAP from your invite into .env}
+      DSTORE_STORAGE_MAX: ${STORAGE_MAX:-50GB}
+    volumes:
+      - ipfs:/data/ipfs
+    ports:
+      # Optional. Forwarding this port on your router lets other nodes reach you
+      # directly; without it, traffic goes through the gateway's relay.
+      - "${P2P_PORT:-4001}:4001/tcp"
+    # The RPC API (port 5001) is deliberately not published: only the agent uses it.
+
+  agent:
+    build: ./agent
+    restart: unless-stopped
+    depends_on:
+      - kubo
+    environment:
+      COORDINATOR_URL: ${COORDINATOR_URL:?paste COORDINATOR_URL from your invite into .env}
+      ENROLLMENT_CODE: ${ENROLLMENT_CODE:-}
+      NODE_NAME: ${NODE_NAME:-}
+      KUBO_API_URL: http://kubo:5001
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - agent:/state
+
+volumes:
+  ipfs:
+  agent:

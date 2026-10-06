@@ -7,6 +7,7 @@ so the same image runs locally, on staging and in production. See
 """
 
 import os
+import sys
 from pathlib import Path
 
 import dj_database_url
@@ -50,6 +51,7 @@ INSTALLED_APPS = [
     "accounts",
     "files",
     "storage",
+    "network",
 ]
 
 MIDDLEWARE = [
@@ -97,6 +99,11 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 AUTH_PASSWORD_VALIDATORS = []  # The server only ever sees a derived auth key, never the passphrase.
 
+# The test suite hashes hundreds of auth keys; a fast hasher keeps it quick.
+# Real servers keep Django's default (PBKDF2 with a high iteration count).
+if sys.argv[1:2] == ["test"]:
+    PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
+
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
 USE_I18N = True
@@ -119,6 +126,15 @@ STORAGES = {
 }
 
 WHITENOISE_USE_FINDERS = DEBUG
+
+# Rate limits live in the database so every gunicorn worker shares one count.
+# The table is created by a migration (accounts 0002).
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": "dstore_cache",
+    }
+}
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": ["accounts.authentication.HashedTokenAuthentication"],
@@ -146,12 +162,64 @@ MAX_FILE_SIZE = env_int("MAX_FILE_SIZE", 1024 * 1024 * 1024)  # 1 GB for the MVP
 # plus headroom must fit.
 DATA_UPLOAD_MAX_MEMORY_SIZE = SEGMENT_SIZE + 64 * 1024
 
-# Where encrypted segments live. M1 stages them on the coordinator's disk;
-# M2 swaps in a backend that pins them on storage nodes through Kubo.
-SEGMENT_STORE = {
-    "BACKEND": os.environ.get("SEGMENT_STORE_BACKEND", "storage.backends.LocalSegmentStore"),
-    "OPTIONS": {"root": os.environ.get("STAGING_DIR", str(BASE_DIR / "staging"))},
-}
+# Where encrypted segments live.
+#   local: on the coordinator's disk (development, and the Locked Box setup)
+#   ipfs:  on the gateway's IPFS node, then copied out to storage nodes
+SEGMENT_STORE_KIND = os.environ.get("SEGMENT_STORE", "local").lower()
+KUBO_API_URL = os.environ.get("KUBO_API_URL", "http://127.0.0.1:5001")
+KUBO_FETCH_TIMEOUT_SECONDS = env_int("KUBO_FETCH_TIMEOUT_SECONDS", 60)
+
+if SEGMENT_STORE_KIND == "ipfs":
+    SEGMENT_STORE = {
+        "BACKEND": "storage.backends.KuboSegmentStore",
+        "OPTIONS": {"api_url": KUBO_API_URL, "fetch_timeout": KUBO_FETCH_TIMEOUT_SECONDS},
+    }
+elif SEGMENT_STORE_KIND == "local":
+    SEGMENT_STORE = {
+        "BACKEND": "storage.backends.LocalSegmentStore",
+        "OPTIONS": {"root": os.environ.get("STAGING_DIR", str(BASE_DIR / "staging"))},
+    }
+else:
+    raise RuntimeError(f"SEGMENT_STORE must be 'local' or 'ipfs', not {SEGMENT_STORE_KIND!r}.")
+
+# --- Storage network (Many Homes) ------------------------------------------
+
+# How many nodes hold each segment, and whether those nodes must belong to
+# different operators. Keep this on in production: it's what stops one operator
+# switching off from taking every copy of a file with them.
+REPLICA_COUNT = env_int("REPLICA_COUNT", 3)
+REQUIRE_DISTINCT_OPERATORS = env_bool("REQUIRE_DISTINCT_OPERATORS", True)
+# Space a node must have left over after taking a new segment.
+PLACEMENT_HEADROOM_BYTES = env_int("PLACEMENT_HEADROOM_BYTES", 64 * 1024 * 1024)
+
+# Nodes check in this often. A node silent for longer than NODE_OFFLINE_AFTER
+# gets no new copies until it's back.
+NODE_HEARTBEAT_SECONDS = env_int("NODE_HEARTBEAT_SECONDS", 15)
+NODE_OFFLINE_AFTER_SECONDS = env_int("NODE_OFFLINE_AFTER_SECONDS", 90)
+NODE_TASK_BATCH = env_int("NODE_TASK_BATCH", 20)
+NODE_INVITE_TTL_HOURS = env_int("NODE_INVITE_TTL_HOURS", 168)
+
+# A copy not confirmed within this time is dropped and placed on another node.
+ASSIGNMENT_TIMEOUT_SECONDS = env_int("ASSIGNMENT_TIMEOUT_SECONDS", 3600)
+PIN_MAX_ATTEMPTS = env_int("PIN_MAX_ATTEMPTS", 3)
+
+# Uploads never finished within this time are deleted, copies and all.
+ABANDONED_UPLOAD_AFTER_HOURS = env_int("ABANDONED_UPLOAD_AFTER_HOURS", 48)
+
+# Background worker cadence.
+WORKER_INTERVAL_SECONDS = env_int("WORKER_INTERVAL_SECONDS", 5)
+GATEWAY_GC_INTERVAL_SECONDS = env_int("GATEWAY_GC_INTERVAL_SECONDS", 900)
+
+# Shared with nodes in their invite so they can join the private IPFS network.
+# Create one with `python manage.py create_swarm_key`.
+IPFS_SWARM_KEY = os.environ.get("IPFS_SWARM_KEY", "")
+# Where nodes reach the gateway's IPFS node from the internet.
+GATEWAY_P2P_HOST = os.environ.get("GATEWAY_P2P_HOST") or os.environ.get("DOMAIN", "127.0.0.1")
+GATEWAY_P2P_PORT = env_int("GATEWAY_P2P_PORT", 4001)
+# The coordinator's public address, written into node invites.
+PUBLIC_URL = os.environ.get("PUBLIC_URL") or (
+    f"https://{os.environ['DOMAIN']}" if os.environ.get("DOMAIN") else "http://127.0.0.1:8000"
+)
 
 # --- Key derivation ----------------------------------------------------------
 

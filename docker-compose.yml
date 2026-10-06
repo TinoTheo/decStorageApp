@@ -1,8 +1,25 @@
-# Staging stack for M1: Caddy (HTTPS) -> coordinator -> Postgres.
-# M2 adds the gateway Kubo node, a relay, Redis and Celery workers here.
+# The coordinator VM (Many Homes):
+#   Caddy (HTTPS) -> coordinator -> Postgres
+#   worker: places copies on nodes and keeps them right
+#   ipfs:   the gateway IPFS node storage nodes connect to (port 4001)
 #
 #   cp .env.example .env   # then set real secrets
 #   docker compose up -d --build
+
+x-coordinator: &coordinator
+  build:
+    context: .
+    dockerfile: coordinator/Dockerfile
+  restart: unless-stopped
+  env_file: .env
+  environment: &coordinator-env
+    DATABASE_URL: postgres://dstore:${POSTGRES_PASSWORD}@db:5432/dstore
+    SEGMENT_STORE: ipfs
+    KUBO_API_URL: http://ipfs:5001
+    STAGING_DIR: /data/staging
+    NUM_PROXIES: "1"
+  volumes:
+    - staging:/data/staging
 
 services:
   db:
@@ -21,20 +38,12 @@ services:
       retries: 10
 
   coordinator:
-    build:
-      context: .
-      dockerfile: coordinator/Dockerfile
-    restart: unless-stopped
+    <<: *coordinator
     depends_on:
       db:
         condition: service_healthy
-    env_file: .env
-    environment:
-      DATABASE_URL: postgres://dstore:${POSTGRES_PASSWORD}@db:5432/dstore
-      STAGING_DIR: /data/staging
-      NUM_PROXIES: "1"
-    volumes:
-      - staging:/data/staging
+      ipfs:
+        condition: service_started
     expose:
       - "8000"
     healthcheck:
@@ -42,6 +51,30 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
+
+  worker:
+    <<: *coordinator
+    command: ["python", "manage.py", "run_worker"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  # The gateway's IPFS node: new uploads are staged here until nodes hold their
+  # copies, and nodes connect to it to join the private network.
+  ipfs:
+    build: ./node/kubo
+    restart: unless-stopped
+    environment:
+      DSTORE_ROLE: gateway
+      DSTORE_SWARM_KEY: ${IPFS_SWARM_KEY:?create one with `manage.py create_swarm_key` and set IPFS_SWARM_KEY in .env}
+      DSTORE_STORAGE_MAX: ${GATEWAY_STORAGE_MAX:-20GB}
+    volumes:
+      - ipfs:/data/ipfs
+    ports:
+      - "4001:4001/tcp"
+    # The RPC API (5001) is reachable only by the coordinator and worker, never published.
+    expose:
+      - "5001"
 
   # Browsers only allow WebCrypto on HTTPS pages, so TLS isn't optional.
   # Caddy fetches and renews a certificate for DOMAIN automatically.
@@ -63,5 +96,6 @@ services:
 volumes:
   pgdata:
   staging:
+  ipfs:
   caddy_data:
   caddy_config:

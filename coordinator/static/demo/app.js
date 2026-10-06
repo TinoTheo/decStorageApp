@@ -105,12 +105,22 @@ $("sign-out").addEventListener("click", async () => {
 });
 
 // --- Files --------------------------------------------------------------
+let refreshTimer = null;
+
 async function refresh() {
+  clearTimeout(refreshTimer);
   try {
     const files = await client.listFiles();
     const list = $("files");
     list.replaceChildren(...files.map(renderFile));
     show($("empty"), files.length === 0);
+    if (files.some((f) => f.copies === null)) {
+      $("mode-note").textContent = "Local mode: encrypted files stay on this server; no storage network is connected.";
+    }
+    // Keep the copy counts live while files are still spreading to nodes.
+    if (files.some((f) => f.status === "complete" && f.copies !== null && f.copies < f.targetCopies)) {
+      refreshTimer = setTimeout(() => client.isSignedIn && refresh(), 3000);
+    }
   } catch (err) {
     showFilesError(err);
   }
@@ -131,7 +141,17 @@ function renderFile(file) {
   }
   const sub = document.createElement("div");
   sub.className = "sub";
-  sub.textContent = `${fmtSize(file.size)} · ${fmtDate(file.createdAt)}`;
+  sub.textContent = `${fmtSize(file.size)} · ${fmtDate(file.createdAt)} `;
+  if (file.status === "complete" && file.copies !== null) {
+    const copies = document.createElement("span");
+    const done = file.copies >= file.targetCopies;
+    copies.className = `copies ${done ? "done" : "spreading"}`;
+    copies.textContent = done
+      ? `${file.copies} copies on separate nodes`
+      : `Spreading copies… ${file.copies} of ${file.targetCopies}`;
+    copies.title = "Confirmed copies held by storage nodes run by different operators";
+    sub.append(copies);
+  }
   meta.append(title, sub);
   li.append(meta);
 
