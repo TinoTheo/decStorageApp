@@ -9,3 +9,4 @@ node_modules/
 README.md
 Makefile
 CHANGELOG.md
+.env.example
