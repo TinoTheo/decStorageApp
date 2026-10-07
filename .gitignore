@@ -1,4 +1,6 @@
 .env
+.gitignore
+.gitattributes
 __pycache__/
 *.pyc
 coordinator/db.sqlite3
