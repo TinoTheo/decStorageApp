@@ -11,4 +11,3 @@ node_modules/
 .env.example
 CHANGELOG.md
 Makefile
-README.md
